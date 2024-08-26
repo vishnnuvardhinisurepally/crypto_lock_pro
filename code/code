@@ -1,0 +1,286 @@
+import tkinter as tk
+from tkinter import filedialog, messagebox
+import customtkinter as ctk
+import os
+import smtplib
+from email.message import EmailMessage
+from Crypto.Protocol.KDF import PBKDF2
+from Crypto.Cipher import AES
+from Crypto.Random import get_random_bytes
+from Crypto.Util.Padding import pad, unpad
+import pyotp
+import logging
+
+logging.basicConfig(level=logging.DEBUG)
+
+class Encryptor:
+    def __init__(self, key):
+        self.key = key
+
+    def encrypt(self, plaintext):
+        iv = get_random_bytes(AES.block_size)
+        cipher = AES.new(self.key, AES.MODE_CBC, iv=iv)
+        ciphertext = cipher.encrypt(pad(plaintext, AES.block_size))
+        return iv + ciphertext
+
+    def decrypt(self, ciphertext):
+        iv = ciphertext[:AES.block_size]
+        cipher = AES.new(self.key, AES.MODE_CBC, iv=iv)
+        plaintext = unpad(cipher.decrypt(ciphertext[AES.block_size:]), AES.block_size)
+        return plaintext
+
+    def encrypt_file(self, file_name):
+        with open(file_name, 'rb') as f:
+            plaintext = f.read()
+        ciphertext = self.encrypt(plaintext)
+        with open(file_name + ".enc", 'wb') as f:
+            f.write(ciphertext)
+        os.remove(file_name)
+
+    def decrypt_file(self, file_name):
+        with open(file_name, 'rb') as f:
+            ciphertext = f.read()
+        plaintext = self.decrypt(ciphertext)
+        with open(file_name[:-4], 'wb') as f:
+            f.write(plaintext)
+        os.remove(file_name)
+
+    def get_all_files(self, directory, extension=None):
+        files = []
+        for root, _, file_list in os.walk(directory):
+            for fname in file_list:
+                if extension:
+                    if fname.endswith(extension):
+                        files.append(os.path.join(root, fname))
+                else:
+                    if not fname.endswith('.enc') and not fname.endswith('.key'):
+                        files.append(os.path.join(root, fname))
+        return files
+
+    def encrypt_all_files(self, directory):
+        files = self.get_all_files(directory)
+        for file_name in files:
+            self.encrypt_file(file_name)
+
+    def decrypt_all_files(self, directory):
+        encrypted_files = self.get_all_files(directory, '.enc')
+        for file_name in encrypted_files:
+            self.decrypt_file(file_name)
+
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+
+        self.key = None
+        self.otp_verified = False
+        self.email = None
+        self.otp_secret = pyotp.random_base32()  
+
+        self.create_initial_widgets()
+
+    def create_initial_widgets(self):
+        self.title("Setup Password")
+        self.geometry("400x400")
+
+        email_label = ctk.CTkLabel(self, text="Enter Email:", font=("Roboto", 16), text_color="black")
+        email_label.pack(pady=10)
+
+        self.email_entry = ctk.CTkEntry(self)
+        self.email_entry.pack(pady=10)
+
+        password_label = ctk.CTkLabel(self, text="Enter Password:", font=("Roboto", 16), text_color="black")
+        password_label.pack(pady=10)
+
+        self.password_entry = ctk.CTkEntry(self, show='*')
+        self.password_entry.pack(pady=10)
+
+        confirm_password_label = ctk.CTkLabel(self, text="Confirm Password:", font=("Roboto", 16), text_color="black")
+        confirm_password_label.pack(pady=10)
+
+        self.confirm_password_entry = ctk.CTkEntry(self, show='*')
+        self.confirm_password_entry.pack(pady=10)
+
+        submit_button = ctk.CTkButton(self, text="Submit", command=self.setup_password_action, height=2, width=20, font=("Roboto", 16))
+        submit_button.pack(pady=20)
+
+    def setup_password_action(self):
+        self.email = self.email_entry.get()
+        if not self.email:
+            messagebox.showerror("Error", "Enter valid Email")
+            return
+
+        self.send_otp()
+        otp = self.prompt_otp()
+
+        if otp and self.verify_otp(otp):
+            password = self.password_entry.get()
+            confirm_password = self.confirm_password_entry.get()
+            if password == confirm_password:
+                self.key = PBKDF2(password.encode('utf-8'), b'salt', dkLen=32, count=100000)
+                with open("data.txt", "w") as f:
+                    f.write(password)
+                enc = Encryptor(self.key)
+                enc.encrypt_file("data.txt")
+                messagebox.showinfo("Setup Complete", "Password setup complete. Please restart the application.")
+                self.destroy()  
+
+                main_app = AppMain(self.key)
+                main_app.mainloop()
+            else:
+                messagebox.showerror("Error", "Passwords do not match. Please try again.")
+        else:
+            messagebox.showerror("Error", "Invalid OTP. Please try again.")
+
+    def send_otp(self):
+        totp = pyotp.TOTP(self.otp_secret)
+        otp = totp.now()
+        logging.debug(f"Generating OTP")
+        self.send_email(self.email, otp)
+        messagebox.showinfo("OTP Sent", "OTP has been sent to your email. Please check.")
+
+    def send_email(self, recipient, otp):
+        sender_email = "yourmailaddress"  # Replace with your email
+        sender_password = "yourpassword"     # Replace with your password
+
+        msg = EmailMessage()
+        msg.set_content(f"Your OTP is: {otp}")
+        msg['Subject'] = 'OTP Verification'
+        msg['From'] = sender_email
+        msg['To'] = recipient
+
+        try:
+            with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp:
+                smtp.login(sender_email, sender_password)
+                smtp.send_message(msg)
+            print("Email sent successfully!")
+        except Exception as e:
+            print(f"Failed to send email: {e}")
+
+    def verify_otp(self, entered_otp):
+        logging.debug(f"Verifying OTP: {entered_otp} for secret: {self.otp_secret}")
+        totp = pyotp.TOTP(self.otp_secret)
+        is_valid = totp.verify(entered_otp)
+        logging.debug(f"OTP valid: {is_valid}")
+        return is_valid
+
+    def prompt_otp(self):
+        otp_window = ctk.CTkInputDialog(title="OTP Verification")
+        return otp_window.get_input()
+
+class AppMain(tk.Tk):
+    def __init__(self, key):
+        super().__init__()
+
+        self.key = key
+
+        self.create_main_widgets()
+
+
+    def create_main_widgets(self):
+        self.title("Lock My File")
+        self.geometry("600x600")
+
+        self.frame = ctk.CTkFrame(self, fg_color="Black")
+        self.frame.pack(pady=20, padx=60, fill="both", expand=True)
+
+        self.label = ctk.CTkLabel(self.frame, text="Lock My File", font=("times_new_roman bold", 24), text_color="white")
+        self.label.pack(pady=20)
+
+        self.password_label = ctk.CTkLabel(self.frame, text="Enter Password:",  font=("Roboto", 16), text_color="white")
+        self.password_label.pack(pady=5)
+
+        self.password_entry = ctk.CTkEntry(self.frame, show='*')
+        self.password_entry.pack(pady=5)
+
+        self.confirm_password_label = ctk.CTkLabel(self.frame, text="Confirm Password:",  font=("Roboto", 16), text_color="white")
+        self.confirm_password_label.pack(pady=5)
+
+        self.confirm_password_entry = ctk.CTkEntry(self.frame, show='*')
+        self.confirm_password_entry.pack(pady=5)
+
+        self.password_button = ctk.CTkButton(self.frame, text="Verify Password", command=self.verify_password_action, height=2, font=("Roboto", 16))
+        self.password_button.pack(pady=10)
+
+    
+
+
+    def verify_password_action(self):
+        password = self.password_entry.get()
+        confirm_password = self.confirm_password_entry.get()
+        if password == confirm_password:
+            
+            self.encrypt_file_button = ctk.CTkButton(self.frame, text="Encrypt File", command=self.encrypt_file_gui, height=2, font=("Roboto", 16))
+            self.encrypt_file_button.pack(pady=10)
+
+            self.decrypt_file_button = ctk.CTkButton(self.frame, text="Decrypt File", command=self.decrypt_file_gui, height=2, font=("Roboto", 16))
+            self.decrypt_file_button.pack(pady=10)
+
+            self.encrypt_all_button = ctk.CTkButton(self.frame, text="Encrypt Folder", command=self.encrypt_all_files_gui, height=2, font=("Roboto", 16))
+            self.encrypt_all_button.pack(pady=10)
+
+            self.decrypt_all_button = ctk.CTkButton(self.frame, text="Decrypt Folder", command=self.decrypt_all_files_gui, height=2, font=("Roboto", 16))
+            self.decrypt_all_button.pack(pady=10)
+            self.key = PBKDF2(password.encode('utf-8'), b'salt', dkLen=32, count=100000)
+            self.otp_verified = False  
+            messagebox.showinfo("Password Verified", "Password verified.")
+        else:
+            messagebox.showerror("Error", "Passwords do not match. Please try again.")
+
+    def verify_otp_action(self):
+        entered_otp = self.otp_entry.get()
+        if self.verify_otp(entered_otp):
+            self.otp_verified = True
+            messagebox.showinfo("OTP Verified", "OTP verification successful.")
+            self.create_main_widgets()
+        else:
+            messagebox.showerror("Error", "Invalid OTP. Please try again.")
+    def encrypt_file_gui(self):
+        if not self.key:
+            messagebox.showerror("Error", "Set or verify the password first.")
+            return
+        file_path = filedialog.askopenfilename()
+        if file_path:
+            enc = Encryptor(self.key)
+            enc.encrypt_file(file_path)
+            messagebox.showinfo("Success", f"File '{file_path}' encrypted successfully!")
+
+    def decrypt_file_gui(self):
+        if not self.key:
+            messagebox.showerror("Error", "Set or verify the password first.")
+            return
+        file_path = filedialog.askopenfilename()
+        if file_path:
+            enc = Encryptor(self.key)
+            try:
+                enc.decrypt_file(file_path)
+                messagebox.showinfo("Success", f"File '{file_path}' decrypted successfully!")
+            except ValueError as e:
+                messagebox.showerror("Error", f"Failed to decrypt file: {str(e)}")
+
+    def encrypt_all_files_gui(self):
+        if not self.key:
+            messagebox.showerror("Error", "Set or verify the password first.")
+            return
+        folder_path = filedialog.askdirectory()
+        if folder_path:
+            enc = Encryptor(self.key)
+            enc.encrypt_all_files(folder_path)
+            messagebox.showinfo("Success", f"All files in '{folder_path}' encrypted successfully!")
+
+    def decrypt_all_files_gui(self):
+        if not self.key:
+            messagebox.showerror("Error", "Set or verify the password first.")
+            return
+        folder_path = filedialog.askdirectory()
+        if folder_path:
+            enc = Encryptor(self.key)
+            try:
+                enc.decrypt_all_files(folder_path)
+                messagebox.showinfo("Success", f"All files in '{folder_path}' decrypted successfully!")
+            except ValueError as e:
+                messagebox.showerror("Error", f"Failed to decrypt files: {str(e)}")
+
+
+if __name__ == "__main__":
+    app = App()
+    app.mainloop()
